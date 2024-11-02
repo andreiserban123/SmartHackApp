@@ -1,274 +1,421 @@
-# Supply Chain Optimization Application for SmartHacks 2024
-# This application optimizes fuel delivery from refineries to customers through storage tanks
-# while minimizing costs and CO2 emissions.
+import time
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import requests
 import json
 import sys
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
 
 # Constants
 API_KEY = "7bcd6334-bc2e-4cbf-b9d4-61cb9e868869"
 BASE_URL = "http://localhost:8080/api/v1"
-TOTAL_DAYS = 42  # Configurable number of rounds
+TOTAL_DAYS = 42
 
 
-class SupplyChainData:
-    """Class to load and manage supply chain data from CSV files"""
-
-    def __init__(self, data_dir: str = "data"):
-        self.data_dir = data_dir
-        self.refineries_df = None
-        self.tanks_df = None
-        self.customers_df = None
-        self.demands_df = None
-
-    def load_data(self):
-        """Load all CSV files from the data directory"""
-        try:
-            print(f"\nLoading data from {self.data_dir}")
-
-            # Load data with semicolon separator
-            self.refineries_df = pd.read_csv(
-                os.path.join(self.data_dir, "refineries.csv"), sep=";"
-            )
-            self.tanks_df = pd.read_csv(
-                os.path.join(self.data_dir, "tanks.csv"), sep=";"
-            )
-            self.customers_df = pd.read_csv(
-                os.path.join(self.data_dir, "customers.csv"), sep=";"
-            )
-            self.demands_df = pd.read_csv(
-                os.path.join(self.data_dir, "demands.csv"), sep=";"
-            )
-
-            print("\nData loaded successfully:")
-            print(f"Refineries: {len(self.refineries_df)} records")
-            print(f"Storage Tanks: {len(self.tanks_df)} records")
-            print(f"Customers: {len(self.customers_df)} records")
-            print(f"Demands: {len(self.demands_df)} records")
-            return True
-
-        except FileNotFoundError as e:
-            print(f"Error loading data files: {e}")
-            return False
-        except pd.errors.EmptyDataError as e:
-            print(f"Error: One of the CSV files is empty: {e}")
-            return False
-
-    def get_refinery_info(self, refinery_id: str) -> dict:
-        """Get information about a specific refinery"""
-        refinery = self.refineries_df[self.refineries_df["id"] == refinery_id].iloc[0]
-        return refinery.to_dict()
-
-    def get_tank_info(self, tank_id: str) -> dict:
-        """Get information about a specific storage tank"""
-        tank = self.tanks_df[self.tanks_df["id"] == tank_id].iloc[0]
-        return tank.to_dict()
-
-    def get_customer_info(self, customer_id: str) -> dict:
-        """Get information about a specific customer"""
-        customer = self.customers_df[self.customers_df["id"] == customer_id].iloc[0]
-        return customer.to_dict()
-
-    def get_customer_demands(self, customer_id: str) -> pd.DataFrame:
-        """Get all demands for a specific customer"""
-        return self.demands_df[self.demands_df["customer_id"] == customer_id]
+@dataclass
+class Connection:
+    id: str
+    source_id: str
+    destination_id: str
+    transport_type: str  # 'PIPELINE' or 'TRUCK'
+    lead_time: int
+    max_capacity: float
+    distance: float
+    cost_per_unit_distance: float
+    co2_per_unit_distance: float
 
 
-class APITester:
-    """Class for testing API connectivity and functionality"""
+@dataclass
+class Demand:
+    id: str
+    customer_id: str
+    quantity: float
+    post_day: int
+    start_delivery_day: int
+    end_delivery_day: int
+    remaining_quantity: float = None
 
+    def __post_init__(self):
+        if self.remaining_quantity is None:
+            self.remaining_quantity = self.quantity
+
+
+class SupplyChainOptimizer:
     def __init__(self):
         self.session_id = None
-        self.headers = {"API-KEY": API_KEY, "Content-Type": "application/json"}
-        self.data = SupplyChainData()
-        self.data.load_data()
+        self.current_day = 0
+        self.data = self._load_data()
+        self.active_demands: List[Demand] = []
+        self.connections_map: Dict[Tuple[str, str], Connection] = {}
 
-    def test_start_session(self):
-        """Test starting a new session"""
-        print("\nTesting session start...")
-        try:
-            response = requests.post(f"{BASE_URL}/session/start", headers=self.headers)
-            print(f"Status Code: {response.status_code}")
-            print(f"Response: {json.dumps(response.json(), indent=2)}")
+    def _load_data(self) -> dict:
+        """Load and prepare all necessary data"""
+        # First try to find data relative to the current file
+        possible_paths = [
+            Path("data"),  # Local data directory
+            Path("../data"),  # One level up
+            Path("../../data"),  # Two levels up
+        ]
 
-            if response.status_code == 200:
-                self.session_id = response.json()["sessionId"]
-                self.headers["SESSION-ID"] = self.session_id
-                print("✓ Session started successfully")
-                return True
-            else:
-                print("✗ Failed to start session")
-                return False
-        except requests.exceptions.RequestException as e:
-            print(f"✗ Error connecting to API: {e}")
-            return False
+        data_dir = None
+        for path in possible_paths:
+            if path.exists() :
+                data_dir = path
+                break
 
-    def test_empty_move(self):
-        """Test submitting an empty move"""
-        print("\nTesting empty move submission...")
-        if not self.session_id:
-            print("✗ No active session")
-            return False
+        if not data_dir:
+            print("Could not find data directory. Tried:")
+            for path in possible_paths:
+                print(f"- {path.absolute()}")
+            print("\nCurrent working directory:", Path.cwd())
+            print("\nAvailable directories:", [d for d in Path().glob("*") if d.is_dir()])
+            raise FileNotFoundError("Data directory not found")
 
-        data = {"currentDay": 0, "movements": []}
+        print(f"\nLoading data from {data_dir}")
 
         try:
-            response = requests.post(
-                f"{BASE_URL}/moves", headers=self.headers, json=data
-            )
-            print(f"Status Code: {response.status_code}")
-            print(f"Response: {json.dumps(response.json(), indent=2)}")
+            # Load CSV files with error handling
+            print("\nLoading refineries.csv...")
+            refineries = pd.read_csv(data_dir / "refineries.csv", sep=';')
+            print(f"Loaded {len(refineries)} refineries")
+            print("First refinery example:")
+            print(refineries.iloc[0])
 
+            print("\nLoading tanks.csv...")
+            tanks = pd.read_csv(data_dir / "tanks.csv", sep=';')
+            print(f"Loaded {len(tanks)} tanks")
+            print("First tank example:")
+            print(tanks.iloc[0])
+
+            print("\nLoading customers.csv...")
+            customers = pd.read_csv(data_dir / "customers.csv", sep=';')
+            print(f"Loaded {len(customers)} customers")
+            print("First customer example:")
+            print(customers.iloc[0])
+
+            print("\nLoading demands.csv...")
+            demands = pd.read_csv(data_dir / "demands.csv", sep=';')
+            print(f"Loaded {len(demands)} demands")
+            print("First demand example:")
+            print(demands.iloc[0])
+
+            # Convert demands to internal format
+            demands_list = []
+            for _, row in demands.iterrows():
+                demands_list.append(Demand(
+                    id=row['id'],
+                    customer_id=row['customer_id'],
+                    quantity=row['quantity'],
+                    post_day=row['post_day'],
+                    start_delivery_day=row['start_delivery_day'],
+                    end_delivery_day=row['end_delivery_day']
+                ))
+
+            return {
+                'refineries': refineries,
+                'tanks': tanks,
+                'customers': customers,
+                'demands': demands_list
+            }
+        except Exception as e:
+            print(f"\nError loading data: {e}")
+            if isinstance(e, pd.errors.EmptyDataError):
+                print("One of the CSV files is empty")
+            elif isinstance(e, pd.errors.ParserError):
+                print("Error parsing CSV file - check the file format and separator")
+            raise
+
+    def cleanup_existing_session(self):
+        """End any existing session"""
+        headers = {
+            'API-KEY': API_KEY,
+            'Content-Type': 'application/json'
+        }
+
+        try:
+            print("Attempting to clean up existing session...")
+            response = requests.post(f"{BASE_URL}/session/end", headers=headers)
             if response.status_code == 200:
-                print("✓ Empty move submitted successfully")
+                print("Successfully cleaned up existing session")
+                return True
+            elif response.status_code == 404:
+                print("No existing session to clean up")
                 return True
             else:
-                print("✗ Failed to submit move")
+                print(f"Failed to clean up session: {response.status_code}")
+                print(response.text)
                 return False
-        except requests.exceptions.RequestException as e:
-            print(f"✗ Error submitting move: {e}")
+        except Exception as e:
+            print(f"Error cleaning up session: {e}")
             return False
 
-    def create_test_movements(self, day: int) -> dict:
-        """Create test movements based on the day"""
-        movements = []
+    def start_session(self):
+        """Start a new game session"""
+        # First, try to clean up any existing session
+        if not self.cleanup_existing_session():
+            print("Warning: Failed to clean up existing session")
 
-        # Get some sample IDs
-        refinery_id = self.data.refineries_df["id"].iloc[0]  # First refinery
-        tank_id = self.data.tanks_df["id"].iloc[0]  # First storage tank
-        customer_id = self.data.customers_df["id"].iloc[0]  # First customer
+        headers = {
+            'API-KEY': API_KEY,
+            'Content-Type': 'application/json'
+        }
 
-        # Day 1: Refinery to Storage Tank movements
-        if day == 1:
-            movements = [
-                {
-                    "sourceId": refinery_id,
-                    "destinationId": tank_id,
-                    "amount": float(
-                        min(
-                            self.data.get_refinery_info(refinery_id)["max_output"],
-                            self.data.get_tank_info(tank_id)["max_input"],
-                        )
-                        / 2
-                    ),  # Using half of the smaller maximum capacity
-                }
-            ]
-            print(f"\nMoving from Refinery {refinery_id} to Tank {tank_id}")
-            print(
-                f"Refinery max output: {self.data.get_refinery_info(refinery_id)['max_output']}"
-            )
-            print(f"Tank max input: {self.data.get_tank_info(tank_id)['max_input']}")
+        try:
+            print("\nStarting new session...")
+            response = requests.post(f"{BASE_URL}/session/start", headers=headers)
 
-        # Day 2: Storage Tank to Customer movements
-        elif day == 2:
-            customer_demand = self.data.get_customer_demands(customer_id)
-            if not customer_demand.empty:
-                demand_amount = customer_demand.iloc[0]["quantity"]
-                movements = [
-                    {
-                        "sourceId": tank_id,
-                        "destinationId": customer_id,
-                        "amount": float(
-                            min(
-                                demand_amount,
-                                self.data.get_customer_info(customer_id)["max_input"],
-                                self.data.get_tank_info(tank_id)["max_output"],
-                            )
-                        ),
-                    }
-                ]
-                print(f"\nMoving from Tank {tank_id} to Customer {customer_id}")
-                print(f"Demand amount: {demand_amount}")
-                print(
-                    f"Customer max input: {self.data.get_customer_info(customer_id)['max_input']}"
-                )
-                print(
-                    f"Tank max output: {self.data.get_tank_info(tank_id)['max_output']}"
-                )
-
-        return {"currentDay": day, "movements": movements}
-
-    def test_sample_moves(self):
-        """Test submitting sample moves for multiple days"""
-        if not self.session_id:
-            print("✗ No active session")
-            return False
-
-        for day in range(1, 3):
-            print(f"\nTesting moves for day {day}...")
-            data = self.create_test_movements(day)
-
-            print(f"\nRequest payload:")
-            print(json.dumps(data, indent=2))
-
-            try:
-                response = requests.post(
-                    f"{BASE_URL}/moves", headers=self.headers, json=data
-                )
-                print(f"Status Code: {response.status_code}")
-                print(f"Response: {json.dumps(response.json(), indent=2)}")
-
-                if response.status_code == 200:
-                    print(f"✓ Day {day} moves submitted successfully")
+            if response.status_code == 200:
+                self.session_id = response.text.strip('"')
+                if self.session_id:
+                    print(f"Session started successfully: {self.session_id}")
+                    return True
                 else:
-                    print(f"✗ Failed to submit moves for day {day}")
+                    print("Error: Session ID not found in response")
                     return False
-            except requests.exceptions.RequestException as e:
-                print(f"✗ Error submitting moves: {e}")
-                return False
-        return True
-
-    def test_end_session(self):
-        """Test ending the session"""
-        print("\nTesting session end...")
-        try:
-            response = requests.post(f"{BASE_URL}/session/end", headers=self.headers)
-            print(f"Status Code: {response.status_code}")
-
-            if response.status_code == 200:
-                print("✓ Session ended successfully")
-                return True
             else:
-                print("✗ Failed to end session")
+                print(f"Failed to start session: {response.status_code}")
+                print(f"Response: {response.text}")
                 return False
         except requests.exceptions.RequestException as e:
-            print(f"✗ Error ending session: {e}")
+            print(f"Network error starting session: {e}")
+            return False
+        except Exception as e:
+            print(f"Unexpected error starting session: {e}")
             return False
 
+    def create_movements(self) -> List[dict]:
+        """Create optimized movements for the current day"""
+        if self.current_day == 0:
+            return []
 
-def test_api_connectivity():
-    """Run all API tests"""
-    tester = APITester()
+        movements = []
+        active_demands = [d for d in self.active_demands
+                          if d.remaining_quantity > 0 and
+                          d.start_delivery_day <= self.current_day <= d.end_delivery_day]
 
-    # Start session
-    if not tester.test_start_session():
-        return
+        # Sort demands by urgency (closest to end delivery day) and size
+        active_demands.sort(key=lambda x: (x.end_delivery_day - self.current_day, -x.quantity))
 
-    # Test empty move
-    tester.test_empty_move()
+        # Track tank levels as we create movements
+        tank_levels = {}
+        for tank in self.data['tanks'].itertuples():
+            tank_levels[tank.id] = tank.initial_stock
 
-    # Test sample moves
-    tester.test_sample_moves()
+        # Process each demand
+        for demand in active_demands:
+            customer_id = demand.customer_id
+            required_quantity = demand.remaining_quantity
 
-    # End session
-    tester.test_end_session()
+            # Find customer max input capacity
+            customer = self.data['customers'][self.data['customers']['id'] == customer_id].iloc[0]
+            max_customer_input = float(customer['max_input'])
+
+            # Find all tanks that can reach this customer
+            potential_sources = []
+            for tank in self.data['tanks'].itertuples():
+                if tank.node_type != 'STORAGE_TANK':
+                    continue
+
+                # Check if there's a connection to this customer
+                connection = self.connections_map.get((tank.id, customer_id))
+                if not connection:
+                    continue
+
+                # Calculate available quantity from this tank
+                available_quantity = min(
+                    tank_levels[tank.id],  # Current tank level
+                    float(tank.max_output),  # Tank output constraint
+                    float(connection.max_capacity),  # Connection capacity
+                    required_quantity,  # Demand remaining
+                    max_customer_input  # Customer input constraint
+                )
+
+                if available_quantity > 0:
+                    # Calculate delivery time
+                    delivery_time = self.current_day + connection.lead_time
+
+                    # Calculate if delivery would be early or late
+                    early_penalty = max(0, demand.start_delivery_day - delivery_time)
+                    late_penalty = max(0, delivery_time - demand.end_delivery_day)
+
+                    # Calculate total cost per unit
+                    cost_per_unit = (
+                            connection.cost_per_unit_distance * connection.distance +  # Transport cost
+                            early_penalty * float(customer.early_delivery_penalty) +  # Early penalty
+                            late_penalty * float(customer.late_delivery_penalty)  # Late penalty
+                    )
+
+                    potential_sources.append({
+                        'tank_id': tank.id,
+                        'connection': connection,
+                        'available_quantity': available_quantity,
+                        'cost_per_unit': cost_per_unit,
+                        'co2_per_unit': connection.co2_per_unit_distance * connection.distance,
+                        'delivery_time': delivery_time
+                    })
+
+            # Sort potential sources by cost and CO2 impact
+            potential_sources.sort(key=lambda x: (
+                max(0, x['delivery_time'] - demand.end_delivery_day),  # Prioritize on-time delivery
+                x['cost_per_unit'],  # Then by cost
+                x['co2_per_unit']  # Then by CO2 emissions
+            ))
+
+            # Create movements from best sources until demand is met
+            remaining_demand = required_quantity
+            for source in potential_sources:
+                if remaining_demand <= 0:
+                    break
+
+                movement_quantity = min(source['available_quantity'], remaining_demand)
+
+                if movement_quantity > 0:
+                    movement = {
+                        'connection_id': source['connection'].id,
+                        'quantity': movement_quantity,
+                        'delivery_day': self.current_day
+                    }
+                    movements.append(movement)
+
+                    # Update tracking
+                    tank_levels[source['tank_id']] -= movement_quantity
+                    remaining_demand -= movement_quantity
+
+        return movements
+
+    def make_move(self, movements: List[dict]) -> dict:
+        """Submit move for the current day"""
+        if not self.session_id:
+            print("No active session")
+            return None
+
+        headers = {
+            'API-KEY': API_KEY,
+            'SESSION-ID': self.session_id,
+            'Content-Type': 'application/json'
+        }
+
+        data = {
+            'day': self.current_day,
+            'movements': movements
+        }
+
+        try:
+            response = requests.post(f"{BASE_URL}/play/round", headers=headers, json=data)
+            if response.status_code == 200:
+                result = response.json()
+
+                # Update internal state
+                self._update_state(result)
+
+                return result
+            else:
+                print(f"Error making move: {response.status_code}")
+                return None
+        except Exception as e:
+            print(f"Error making move: {e}")
+            return None
+
+    def _update_state(self, response: dict):
+        """Update internal state based on API response"""
+        # Update day
+        self.current_day += 1
+
+        # Add new demands
+        for demand in response.get('demands', []):
+            self.active_demands.append(Demand(**demand))
+
+        # Process penalties
+        self._process_penalties(response.get('penalties', []))
+
+        # Update KPIs
+        self._update_kpis(response.get('deltaKpis', {}), response.get('totalKpis', {}))
+
+    def _process_penalties(self, penalties: List[dict]):
+        """Process and analyze penalties"""
+        penalty_types = {}
+        for penalty in penalties:
+            penalty_type = penalty['type']
+            if penalty_type not in penalty_types:
+                penalty_types[penalty_type] = {
+                    'count': 0,
+                    'total_cost': 0,
+                    'total_co2': 0
+                }
+            penalty_types[penalty_type]['count'] += 1
+            penalty_types[penalty_type]['total_cost'] += penalty['cost']
+            penalty_types[penalty_type]['total_co2'] += penalty['co2']
+
+        # Print penalty summary
+        if penalty_types:
+            print("\nPenalties this round:")
+            for ptype, stats in penalty_types.items():
+                print(f"{ptype}: {stats['count']} occurrences, "
+                      f"Cost: {stats['total_cost']:.2f}, "
+                      f"CO2: {stats['total_co2']:.2f}")
+
+    def _update_kpis(self, delta_kpis: dict, total_kpis: dict):
+        """Update and display KPIs"""
+        print(f"\nDay {self.current_day} KPIs:")
+        print(f"Delta - Cost: {delta_kpis.get('cost', 0):.2f}, "
+              f"CO2: {delta_kpis.get('co2', 0):.2f}")
+        print(f"Total - Cost: {total_kpis.get('cost', 0):.2f}, "
+              f"CO2: {total_kpis.get('co2', 0):.2f}")
+
+    def run(self):
+        """Run the complete optimization"""
+        print("\nStarting Supply Chain Optimization")
+        print("=================================")
+        print(f"API URL: {BASE_URL}")
+        print(f"API Key: {API_KEY[:8]}...")
+
+        # Start new session with retry
+        max_retries = 3
+        for attempt in range(max_retries):
+            if self.start_session():
+                break
+            else:
+                if attempt < max_retries - 1:
+                    print(f"Retrying session start ({attempt + 2}/{max_retries})...")
+                    time.sleep(2)  # Wait 2 seconds before retry
+                else:
+                    print("Failed to start session after all retries")
+                    return
+
+        # Run optimization
+        try:
+            while self.current_day < TOTAL_DAYS:
+                print(f"\nProcessing day {self.current_day}")
+                movements = self.create_movements()
+                result = self.make_move(movements)
+
+                if not result:
+                    print("Error occurred, stopping simulation")
+                    break
+
+                # Print daily summary
+                if movements:
+                    print(f"Submitted {len(movements)} movements")
+                else:
+                    print("No movements submitted")
+        except KeyboardInterrupt:
+            print("\nOptimization interrupted by user")
+        except Exception as e:
+            print(f"\nError during optimization: {e}")
+        finally:
+            # Always try to end session cleanly
+            if self.session_id:
+                self.cleanup_existing_session()
 
 
 def main():
-    print("Supply Chain Optimization API Tester")
-    print("===================================")
-    print(f"API URL: {BASE_URL}")
-    print(f"API Key: {API_KEY[:8]}...")
-
-    # Test API connectivity
-    test_api_connectivity()
+    optimizer = SupplyChainOptimizer()
+    optimizer.run()
 
 
 if __name__ == "__main__":
