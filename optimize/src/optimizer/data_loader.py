@@ -97,3 +97,36 @@ class DataLoader:
             print("Available columns:", connections_df.columns.tolist())
 
         return connections_map
+
+    @staticmethod
+    def validate_connections(connections_df: pd.DataFrame, tanks_df: pd.DataFrame, customers_df: pd.DataFrame):
+        """Validate connections against tanks and customers"""
+        print("\nValidating connections...")
+
+        # Get all valid source and destination IDs
+        valid_sources = set(tanks_df['id'].unique())
+        valid_destinations = set(customers_df['id'].unique())
+
+        # Check each connection
+        invalid_connections = []
+        for idx, conn in connections_df.iterrows():
+            source_id = conn['from_id']
+            dest_id = conn['to_id']
+
+            if source_id not in valid_sources:
+                invalid_connections.append(f"Row {idx}: Invalid source {source_id}")
+            if dest_id not in valid_destinations:
+                invalid_connections.append(f"Row {idx}: Invalid destination {dest_id}")
+
+        if invalid_connections:
+            print("\nFound invalid connections:")
+            for msg in invalid_connections:
+                print(msg)
+        else:
+            print("All connections are valid")
+
+        # Print connection statistics
+        print("\nConnection Statistics:")
+        print(f"Total connections: {len(connections_df)}")
+        print(f"Unique sources: {connections_df['from_id'].nunique()}")
+        print(f"Unique destinations: {connections_df['to_id'].nunique()}")
