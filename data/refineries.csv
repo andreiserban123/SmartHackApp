@@ -1,0 +1,8 @@
+id;name;capacity;max_output;production;overflow_penalty;underflow_penalty;over_output_penalty;production_cost;production_co2;initial_stock;node_type
+beb6ba68-6d89-48e0-a6aa-1ee978bafa27;refinery 0;1870;223;186;5.04;2.03;3.23;3.74;5.16;55;REFINERY
+22911035-11f8-4557-8631-df09db9c1c1a;refinery 1;275823;9680;8757;3.31;5.42;2.55;1.62;5.13;17685;REFINERY
+0d62c455-8a4c-44a2-ae6f-79b35dd44e46;refinery 2;45140;3689;3369;4.54;4.46;5.17;4.31;3.83;13632;REFINERY
+d8cfd6b6-f574-4868-a608-abea355bc74c;refinery 3;33770;1050;971;2.34;2.95;3.54;4.46;1.83;12920;REFINERY
+94811572-da3d-4a47-b972-bb4c264a4639;refinery 4;2199;87;65;4.54;3.35;3.35;3.34;4.65;1452;REFINERY
+6186930b-db2b-476d-97b4-252b52d25347;refinery 5;4982;145;141;3.56;2.05;1.58;3.35;4.91;755;REFINERY
+08c75fd4-8900-4aa8-b917-56fa78694d5a;refinery 6;119;3;2;2.65;3.15;5.11;4.18;3.84;0;REFINERY
