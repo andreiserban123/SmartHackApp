@@ -1,171 +1,179 @@
-from typing import List
+# optimizer/movement_planner.py
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional
 
+from src.models.connection import Connection
 from src.models.demand import Demand
+from src.models.facility import Facility
 
 
-class MovementCreator:
-    def __init__(self, data: dict, connections_map: dict):
-        self.data = data
+class MovementPlanner:
+    def __init__(self, facilities: Dict[str, Facility],
+                 connections_map: Dict[Tuple[str, str], Connection],
+                 valid_connections: Dict[str, Dict[str, str]]):
+        self.facilities = facilities
         self.connections_map = connections_map
-        # Create a set of valid connections for faster lookup
-        self.valid_connections = set()
-        self._initialize_valid_connections()
-
-    def _initialize_valid_connections(self):
-        """Initialize set of valid connections from the connections dataframe"""
-        try:
-            for _, conn in self.data['connections'].iterrows():
-                # Store both source-to-dest and connection ID for validation
-                self.valid_connections.add((conn['from_id'], conn['to_id']))
-
-            print(f"Initialized {len(self.valid_connections)} valid connections")
-        except Exception as e:
-            print(f"Error initializing valid connections: {e}")
-            print("Connections columns:", self.data['connections'].columns.tolist())
-
-    def _is_valid_connection(self, source_id: str, destination_id: str) -> bool:
-        """Check if a connection exists between source and destination"""
-        return (source_id, destination_id) in self.valid_connections
+        self.valid_connections = valid_connections
+        self.safety_margin = 0.90  # More conservative safety margin
+        self.max_fill_ratio = 0.92  # Maximum target fill ratio
+        self.min_movement = 50.0  # Minimum movement size to avoid tiny inefficient movements
 
     def create_movements(self, current_day: int, active_demands: List[Demand]) -> List[dict]:
         """Create optimized movements for the current day"""
-        if current_day == 0:
-            print(f"Day 0 - Active demands: {len(active_demands)}")
+        if current_day == 0 or not active_demands:
             return []
 
+        # Track planned changes to facility levels
+        facilities_delta = defaultdict(float)
+
+        # Group demands by customer
+        customer_demands = self._group_demands_by_customer(active_demands, current_day)
+
+        # Create movements to satisfy demands
         movements = []
+        for customer_id, demands in customer_demands.items():
+            total_demand = sum(d.remaining_quantity for d in demands)
+            if total_demand <= 0:
+                continue
 
-        # Get active demands
-        active_demands = [d for d in active_demands
-                          if d.remaining_quantity > 0 and
-                          d.start_delivery_day <= current_day <= d.end_delivery_day]
+            # Get all possible sources for this customer
+            source_options = self._get_source_options(customer_id, total_demand)
 
-        print(f"Day {current_day} - Processing {len(active_demands)} active demands")
-
-        if not active_demands:
-            return movements
-
-        # Track tank inventory
-        tank_inventory = {}
-        for _, tank in self.data['tanks'].iterrows():
-            tank_inventory[tank['id']] = float(tank['initial_stock'])
-
-        # Sort demands by urgency and size
-        active_demands.sort(key=lambda x: (
-            (x.end_delivery_day - current_day),  # Days until deadline
-            -(x.end_delivery_day - x.start_delivery_day),  # Smaller delivery window first
-            -x.remaining_quantity  # Larger quantities first
-        ))
-
-        # Process each demand
-        for demand in active_demands:
-            print(f"Processing demand {demand.id}: {demand.remaining_quantity} units needed")
-
-            customer = self.data['customers'][
-                self.data['customers']['id'] == demand.customer_id].iloc[0]
-            max_customer_input = float(customer['max_input'])
-
-            potential_moves = self._find_potential_moves(
-                demand, customer, tank_inventory, current_day, max_customer_input)
-
-            # Create movements from best options
-            for move in potential_moves:
-                if demand.remaining_quantity <= 0:
+            # Create movements from each viable source
+            remaining_demand = total_demand
+            for source_id, max_quantity in source_options:
+                if remaining_demand <= 0:
                     break
 
-                quantity = min(move['quantity'], demand.remaining_quantity)
+                movement = self._create_safe_movement(
+                    source_id=source_id,
+                    destination_id=customer_id,
+                    quantity_needed=remaining_demand,
+                    max_quantity=max_quantity,
+                    facilities_delta=facilities_delta
+                )
 
-                # Validate quantity before creating movement
-                if quantity <= 0:
-                    print(f"Skipping invalid quantity: {quantity}")
-                    continue
+                if movement and movement['quantity'] >= self.min_movement:
+                    movements.append(movement)
+                    remaining_demand -= movement['quantity']
+                    # Update planned facility changes
+                    facilities_delta[source_id] -= movement['quantity']
+                    facilities_delta[customer_id] += movement['quantity']
 
-                movement = {
-                    'connection_id': move['connection'].id,
-                    'quantity': quantity
-                }
-                movements.append(movement)
-
-                # Update tracking
-                tank_inventory[move['tank_id']] -= quantity
-                demand.remaining_quantity -= quantity
-                print(f"Created movement: {quantity} units from {move['tank_id']} to {demand.customer_id}")
-
-        print(f"Created {len(movements)} movements")
         return movements
 
-    def _find_potential_moves(self, demand, customer, tank_inventory, current_day, max_customer_input):
-        """Find and sort potential moves for a demand"""
-        potential_moves = []
+    def _group_demands_by_customer(self, demands: List[Demand],
+                                   current_day: int) -> Dict[str, List[Demand]]:
+        """Group and prioritize demands by customer"""
+        customer_demands = defaultdict(list)
 
-        for _, tank in self.data['tanks'].iterrows():
-            if tank['node_type'] != 'STORAGE_TANK':
+        for demand in demands:
+            if (demand.start_delivery_day <= current_day <= demand.end_delivery_day
+                    and demand.remaining_quantity > 0):
+                customer_demands[demand.customer_id].append(demand)
+
+        # Sort demands within each customer group
+        for demands in customer_demands.values():
+            demands.sort(key=lambda d: (
+                d.end_delivery_day,  # Earlier deadlines first
+                -d.remaining_quantity  # Larger quantities first
+            ))
+
+        return customer_demands
+
+    def _get_source_options(self, customer_id: str,
+                            quantity_needed: float) -> List[Tuple[str, float]]:
+        """Get all viable sources for a customer, sorted by desirability"""
+        source_options = []
+
+        for source_id, destinations in self.valid_connections.items():
+            if customer_id not in destinations:
                 continue
 
-            # Skip if connection doesn't exist
-            if not self._is_valid_connection(tank['id'], demand.customer_id):
+            source = self.facilities[source_id]
+            if source.current_level <= 0:
                 continue
 
-            connection_key = (tank['id'], demand.customer_id)
-            connection = self.connections_map.get(connection_key)
-
+            # Get connection details
+            connection = self.connections_map.get((source_id, customer_id))
             if not connection:
                 continue
 
-            # Calculate available quantity
-            available_stock = tank_inventory[tank['id']]
-            if available_stock <= 0:
-                continue
-
+            # Calculate maximum safe quantity from this source
             max_quantity = min(
-                demand.remaining_quantity,
-                available_stock,
-                connection.max_capacity,
-                float(tank['max_output']),
-                max_customer_input
+                source.current_level * self.safety_margin,
+                connection.max_capacity * self.safety_margin,
+                quantity_needed
             )
 
-            # Skip if no valid quantity available
             if max_quantity <= 0:
                 continue
 
-            # Calculate delivery timing and costs
-            delivery_time = current_day + connection.lead_time
-            transport_cost = connection.distance * connection.cost_per_unit_distance
-            early_days = max(0, demand.start_delivery_day - delivery_time)
-            late_days = max(0, delivery_time - demand.end_delivery_day)
+            # Score this source
+            source_score = self._score_source(
+                source=source,
+                connection=connection,
+                quantity=max_quantity
+            )
 
-            total_cost = transport_cost * max_quantity
+            source_options.append((source_id, max_quantity, source_score))
 
-            potential_moves.append({
-                'tank_id': tank['id'],
-                'connection': connection,
-                'quantity': max_quantity,
-                'total_cost': total_cost,
-                'delivery_time': delivery_time,
-                'is_on_time': (early_days == 0 and late_days == 0)
-            })
+        # Sort by score (highest first) and return just id and quantity
+        return [(s[0], s[1]) for s in
+                sorted(source_options, key=lambda x: x[2], reverse=True)]
 
-        # Sort potential moves
-        potential_moves.sort(key=lambda x: (
-            not x['is_on_time'],  # Prioritize on-time deliveries
-            x['total_cost'] / x['quantity']  # Then minimize cost per unit
-        ))
+    def _score_source(self, source: Facility, connection: Connection,
+                      quantity: float) -> float:
+        """Score a potential source based on multiple factors"""
+        # Capacity utilization score (prefer sources with more available capacity)
+        utilization = source.current_level / source.capacity
+        capacity_score = 1.0 - (abs(0.5 - utilization) * 2)  # Prefer ~50% utilization
 
-        return potential_moves
+        # Connection efficiency score
+        cost, co2 = connection.calculate_metrics(quantity)
+        efficiency_score = quantity / (cost + co2 + 1.0)  # Add 1.0 to avoid division by zero
 
-    def print_connection_stats(self):
-        """Print statistics about available connections for debugging"""
-        print("\nConnection Statistics:")
-        print(f"Total valid connections: {len(self.valid_connections)}")
+        # Lead time score (prefer shorter lead times)
+        lead_time_score = 1.0 / (1.0 + connection.lead_time)
 
-        # Count connections by type
-        connection_types = self.data['connections']['connection_type'].value_counts()
-        print("\nConnections by type:")
-        for conn_type, count in connection_types.items():
-            print(f"{conn_type}: {count}")
+        # Combine scores with weights
+        return (
+                capacity_score * 0.4 +
+                efficiency_score * 0.4 +
+                lead_time_score * 0.2
+        )
 
-        # Print a few example connections
-        print("\nExample valid connections:")
-        for i, (source, dest) in enumerate(sorted(list(self.valid_connections)[:5])):
-            print(f"{i + 1}. {source} -> {dest}")
+    def _create_safe_movement(self, source_id: str, destination_id: str,
+                              quantity_needed: float, max_quantity: float,
+                              facilities_delta: Dict[str, float]) -> Optional[dict]:
+        """Create a safe movement respecting all constraints"""
+        source = self.facilities[source_id]
+        destination = self.facilities[destination_id]
+
+        # Calculate effective facility levels including planned changes
+        source_effective = source.current_level + facilities_delta[source_id]
+        dest_effective = destination.current_level + facilities_delta[destination_id]
+
+        # Calculate available capacity considering target maximum
+        source_available = source_effective * self.safety_margin
+        dest_available = (destination.capacity * self.max_fill_ratio -
+                          dest_effective)
+
+        # Calculate safe quantity
+        safe_quantity = min(
+            quantity_needed,
+            source_available,
+            dest_available,
+            max_quantity
+        )
+
+        if safe_quantity < self.min_movement:
+            return None
+
+        # Get the connection ID
+        connection_id = self.valid_connections[source_id][destination_id]
+
+        return {
+            'connection_id': connection_id,
+            'quantity': safe_quantity
+        }

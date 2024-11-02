@@ -1,7 +1,10 @@
-import time
+# optimizer/supply_chain_optimizer.py
+from typing import Dict, List
 
+from src.models.demand import Demand
+from src.models.facility import Facility
+from src.optimizer.advance_planner import AdvancedPlanner
 from src.optimizer.data_loader import DataLoader
-from src.optimizer.movement_creator import MovementCreator
 from src.optimizer.session_manager import SessionManager
 
 
@@ -12,47 +15,130 @@ class SupplyChainOptimizer:
         self.total_days = total_days
         self.current_day = 0
 
-        # Load data
+        # Load initial data
+        print("\nInitializing Supply Chain Optimizer...")
         self.data = DataLoader.load_data()
-        self.connections_map = DataLoader.build_connections_map(self.data['connections'])
-        self.active_demands = self.data['initial_demands']
 
         # Initialize components
+        self.facilities: Dict[str, Facility] = self.data['facilities']
+        self.connections_map = self.data['connections_map']
+        self.active_demands: List[Demand] = self.data['initial_demands']
+
         self.session_manager = SessionManager(api_key, base_url)
-        self.movement_creator = MovementCreator(self.data, self.connections_map)
+        self.movement_planner = AdvancedPlanner(
+            facilities=self.facilities,
+            connections_map=self.connections_map,
+            valid_connections=self.data['valid_connections']
+        )
 
-    def _start_session_with_retry(self, max_retries: int = 3) -> bool:
-        """Start a new session with retry mechanism"""
-        for attempt in range(max_retries):
-            if self.session_manager.start_session():
-                return True
-            else:
-                if attempt < max_retries - 1:
-                    print(f"Retrying session start ({attempt + 2}/{max_retries})...")
-                    time.sleep(2)  # Wait 2 seconds before retry
-                else:
-                    print("Failed to start session after all retries")
-                    return False
-        return False
+        print("Initialization complete.")
 
-    def _process_round_result(self, result: dict):
-        """Process the result of a round and update state"""
-        if not result:
-            return False
+    def run(self):
+        """Run the complete supply chain optimization"""
+        print("\nStarting Supply Chain Optimization")
+        print("=================================")
+        print(f"API URL: {self.base_url}")
+        print(f"API Key: {self.api_key[:8]}...")
+        print(f"Total Days: {self.total_days}")
 
-        # Update day
+        # Start session
+        if not self.session_manager.start_session():
+            print("Failed to start session. Exiting.")
+            return
+
+        try:
+            # Main optimization loop
+            while self.current_day < self.total_days:
+                print(f"\nProcessing Day {self.current_day}")
+
+                # Create movements for current day
+                movements = self.movement_planner.create_movements(
+                    self.current_day,
+                    self.active_demands
+                )
+
+                # Submit movements and get results
+                result = self.session_manager.make_move(self.current_day, movements)
+                if not result:
+                    print("Error occurred during move submission")
+                    break
+
+                # Process results and update state
+                self._process_round_result(result)
+
+                # Update facilities based on movements
+                self._update_facility_levels(movements)
+
+                # Clean up completed demands
+                self._cleanup_completed_demands()
+
+                # Print daily summary
+                self._print_daily_summary(movements)
+
+        except KeyboardInterrupt:
+            print("\nOptimization interrupted by user")
+        except Exception as e:
+            print(f"\nError during optimization: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Always try to end session cleanly
+            if self.session_manager.session_id:
+                self.session_manager.cleanup_existing_session()
+
+    def _process_round_result(self, result: dict) -> None:
+        """Process round results and update state"""
+        # Update day counter
         self.current_day += 1
 
-        # Process new demands and update active demands
-        new_demands, penalties, delta_kpis, total_kpis = self.session_manager.process_round_result(result)
+        # Process new demands and penalties
+        new_demands, penalties, delta_kpis, total_kpis = (
+            self.session_manager.process_round_result(result)
+        )
+
+        # Add new demands to active demands
         self.active_demands.extend(new_demands)
 
         # Display round information
-        self._display_round_info(len(new_demands), penalties, delta_kpis, total_kpis)
+        self._display_round_info(
+            new_demands_count=len(new_demands),
+            penalties=penalties,
+            delta_kpis=delta_kpis,
+            total_kpis=total_kpis
+        )
 
-        return True
+    def _update_facility_levels(self, movements: List[dict]) -> None:
+        """Update facility levels based on movements"""
+        for movement in movements:
+            connection_id = movement['connection_id']
+            quantity = movement['quantity']
 
-    def _display_round_info(self, new_demands_count: int, penalties: list, delta_kpis: dict, total_kpis: dict):
+            # Find corresponding connection
+            connection = next(
+                conn for conn in self.connections_map.values()
+                if conn.id == connection_id
+            )
+
+            # Update source facility
+            source = self.facilities[connection.source_id]
+            source.current_level -= quantity
+
+            # Update destination facility
+            destination = self.facilities[connection.destination_id]
+            destination.current_level += quantity
+
+    def _cleanup_completed_demands(self) -> None:
+        """Remove completed demands from active demands list"""
+        self.active_demands = [
+            demand for demand in self.active_demands
+            if demand.remaining_quantity > 0 and
+               demand.end_delivery_day >= self.current_day
+        ]
+
+    def _display_round_info(self, new_demands_count: int,
+                            penalties: List[dict],
+                            delta_kpis: Dict,
+                            total_kpis: Dict) -> None:
         """Display information about the current round"""
         print(f"\nDay {self.current_day} Summary:")
         print(f"New demands received: {new_demands_count}")
@@ -81,47 +167,18 @@ class SupplyChainOptimizer:
         print(f"Total - Cost: {total_kpis.get('cost', 0):.2f}, "
               f"CO2: {total_kpis.get('co2', 0):.2f}")
 
-    def run(self):
-        """Run the complete optimization"""
-        print("\nStarting Supply Chain Optimization")
-        print("=================================")
-        print(f"API URL: {self.base_url}")
-        print(f"API Key: {self.api_key[:8]}...")
+    def _print_daily_summary(self, movements: List[dict]) -> None:
+        """Print summary of daily operations"""
+        if movements:
+            print(f"\nSubmitted {len(movements)} movements")
+            total_quantity = sum(m['quantity'] for m in movements)
+            print(f"Total quantity moved: {total_quantity:.2f}")
 
-        # Start session with retry
-        if not self._start_session_with_retry():
-            return
-
-        # Run optimization
-        try:
-            while self.current_day < self.total_days:
-                print(f"\nProcessing day {self.current_day}")
-
-                # Create and submit movements
-                movements = self.movement_creator.create_movements(
-                    self.current_day, self.active_demands)
-
-                # Submit movements and process results
-                result = self.session_manager.make_move(self.current_day, movements)
-
-                # Process round result and update state
-                if not self._process_round_result(result):
-                    print("Error occurred, stopping simulation")
-                    break
-
-                # Print daily summary
-                if movements:
-                    print(f"Submitted {len(movements)} movements")
-                else:
-                    print("No movements submitted")
-
-        except KeyboardInterrupt:
-            print("\nOptimization interrupted by user")
-        except Exception as e:
-            print(f"\nError during optimization: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            # Always try to end session cleanly
-            if self.session_manager.session_id:
-                self.session_manager.cleanup_existing_session()
+            # Facility status
+            print("\nFacility Status:")
+            for facility in self.facilities.values():
+                capacity_used = (facility.current_level / facility.capacity * 100)
+                print(f"{facility.id}: {facility.current_level:.1f}/{facility.capacity:.1f} "
+                      f"({capacity_used:.1f}% utilized)")
+        else:
+            print("No movements submitted for this day")

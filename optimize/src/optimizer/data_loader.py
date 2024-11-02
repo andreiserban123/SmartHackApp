@@ -1,29 +1,25 @@
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from src.models.connection import Connection
 from src.models.demand import Demand
+from src.models.facility import Facility
 
 
 class DataLoader:
     @staticmethod
-    def load_data(possible_paths: List[Path] = None) -> dict:
+    def load_data(possible_paths: Optional[List[Path]] = None) -> dict:
         """Load and prepare all necessary data"""
         if possible_paths is None:
             possible_paths = [
-                Path("data"),  # Local data directory
-                Path("../data"),  # One level up
-                Path("../../data"),  # Two levels up
+                Path("data"),
+                Path("../data"),
+                Path("../../data"),
             ]
 
-        data_dir = None
-        for path in possible_paths:
-            if path.exists():
-                data_dir = path
-                break
-
+        data_dir = next((path for path in possible_paths if path.exists()), None)
         if not data_dir:
             raise FileNotFoundError("Data directory not found")
 
@@ -37,14 +33,115 @@ class DataLoader:
             demands = pd.read_csv(data_dir / "demands.csv", sep=';')
             connections = pd.read_csv(data_dir / "connections.csv", sep=';')
 
+            # Create validated connection lookup
+            valid_connections = DataLoader._create_connection_lookup(connections)
+
+            # Create facility objects
+            facilities = DataLoader._create_facilities(refineries, tanks, customers)
+
+            # Create connection objects
+            connections_map = DataLoader._create_connections_map(connections)
+
+            # Process demands
+            demands_list = DataLoader._process_demands(demands, valid_connections)
+            initial_demands = [d for d in demands_list if d.post_day == 0]
+
             print(f"Loaded: {len(refineries)} refineries, {len(tanks)} tanks, "
-                  f"{len(customers)} customers, {len(demands)} demands, "
+                  f"{len(customers)} customers, {len(demands_list)} demands, "
                   f"{len(connections)} connections")
 
-            # Convert demands to internal format
-            demands_list = []
-            initial_demands = []
-            for _, row in demands.iterrows():
+            return {
+                'facilities': facilities,
+                'demands': demands_list,
+                'initial_demands': initial_demands,
+                'connections_map': connections_map,
+                'valid_connections': valid_connections
+            }
+
+        except Exception as e:
+            print(f"Error loading data: {e}")
+            raise
+
+    @staticmethod
+    def _create_facilities(refineries: pd.DataFrame, tanks: pd.DataFrame,
+                           customers: pd.DataFrame) -> Dict[str, Facility]:
+        """Create facility objects from dataframes"""
+        facilities = {}
+
+        # Add refineries
+        for _, row in refineries.iterrows():
+            facilities[row['id']] = Facility(
+                id=row['id'],
+                capacity=float(row['capacity']),
+                current_level=float(row['initial_stock'])
+            )
+
+        # Add tanks
+        for _, row in tanks.iterrows():
+            facilities[row['id']] = Facility(
+                id=row['id'],
+                capacity=float(row['capacity']),
+                current_level=float(row['initial_stock'])
+            )
+
+        # Add customers
+        for _, row in customers.iterrows():
+            facilities[row['id']] = Facility(
+                id=row['id'],
+                capacity=float(row['max_input']),
+                current_level=0.0  # Customers start empty
+            )
+
+        return facilities
+
+    @staticmethod
+    def _create_connection_lookup(connections: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+        """Create a lookup dictionary for valid connections with their IDs"""
+        valid_connections = {}
+
+        for _, conn in connections.iterrows():
+            source_id = conn['from_id']
+            dest_id = conn['to_id']
+            conn_id = conn['id']
+
+            if source_id not in valid_connections:
+                valid_connections[source_id] = {}
+
+            valid_connections[source_id][dest_id] = conn_id
+
+        return valid_connections
+
+    @staticmethod
+    def _create_connections_map(connections: pd.DataFrame) -> Dict[Tuple[str, str], Connection]:
+        """Build a map of all possible connections between nodes"""
+        connections_map = {}
+
+        for _, conn in connections.iterrows():
+            connection = Connection(
+                id=conn['id'],
+                source_id=conn['from_id'],
+                destination_id=conn['to_id'],
+                transport_type=conn['connection_type'],
+                lead_time=int(conn['lead_time_days']),
+                max_capacity=float(conn['max_capacity']),
+                distance=float(conn['distance'])
+            )
+            connections_map[(connection.source_id, connection.destination_id)] = connection
+
+        return connections_map
+
+    @staticmethod
+    def _process_demands(demands: pd.DataFrame,
+                         valid_connections: Dict[str, Dict[str, str]]) -> List[Demand]:
+        """Process demands and validate connections"""
+        demands_list = []
+
+        def has_valid_connection(customer_id: str) -> bool:
+            return any(customer_id in destinations
+                       for destinations in valid_connections.values())
+
+        for _, row in demands.iterrows():
+            if has_valid_connection(row['customer_id']):
                 demand = Demand(
                     id=row['id'],
                     customer_id=row['customer_id'],
@@ -54,79 +151,5 @@ class DataLoader:
                     end_delivery_day=row['end_delivery_day']
                 )
                 demands_list.append(demand)
-                if row['post_day'] == 0:
-                    initial_demands.append(demand)
 
-            return {
-                'refineries': refineries,
-                'tanks': tanks,
-                'customers': customers,
-                'demands': demands_list,
-                'connections': connections,
-                'initial_demands': initial_demands
-            }
-
-        except Exception as e:
-            print(f"Error loading data: {e}")
-            raise
-
-    @staticmethod
-    def build_connections_map(connections_df: pd.DataFrame) -> Dict[Tuple[str, str], Connection]:
-        """Build a map of all possible connections between nodes"""
-        connections_map = {}
-
-        try:
-            for _, conn in connections_df.iterrows():
-                connection = Connection(
-                    id=conn['id'],
-                    source_id=conn['from_id'],
-                    destination_id=conn['to_id'],
-                    transport_type=conn['connection_type'],
-                    lead_time=int(conn['lead_time_days']),
-                    max_capacity=float(conn['max_capacity']),
-                    distance=float(conn['distance']),
-                    cost_per_unit_distance=1.0,  # Default value
-                    co2_per_unit_distance=0.5  # Default value
-                )
-                connections_map[(connection.source_id, connection.destination_id)] = connection
-
-            print(f"Mapped {len(connections_map)} connections")
-
-        except Exception as e:
-            print(f"Error building connections map: {e}")
-            print("Available columns:", connections_df.columns.tolist())
-
-        return connections_map
-
-    @staticmethod
-    def validate_connections(connections_df: pd.DataFrame, tanks_df: pd.DataFrame, customers_df: pd.DataFrame):
-        """Validate connections against tanks and customers"""
-        print("\nValidating connections...")
-
-        # Get all valid source and destination IDs
-        valid_sources = set(tanks_df['id'].unique())
-        valid_destinations = set(customers_df['id'].unique())
-
-        # Check each connection
-        invalid_connections = []
-        for idx, conn in connections_df.iterrows():
-            source_id = conn['from_id']
-            dest_id = conn['to_id']
-
-            if source_id not in valid_sources:
-                invalid_connections.append(f"Row {idx}: Invalid source {source_id}")
-            if dest_id not in valid_destinations:
-                invalid_connections.append(f"Row {idx}: Invalid destination {dest_id}")
-
-        if invalid_connections:
-            print("\nFound invalid connections:")
-            for msg in invalid_connections:
-                print(msg)
-        else:
-            print("All connections are valid")
-
-        # Print connection statistics
-        print("\nConnection Statistics:")
-        print(f"Total connections: {len(connections_df)}")
-        print(f"Unique sources: {connections_df['from_id'].nunique()}")
-        print(f"Unique destinations: {connections_df['to_id'].nunique()}")
+        return demands_list
